@@ -1,6 +1,6 @@
-# 📝 AI Audit Note Assistant
+# 📝 AI Note Assistant
 
-회계법인 감사팀을 위한 **AI 기반 메모 자동화** 데스크톱 애플리케이션
+**AI 기반 메모 자동화** 데스크톱 애플리케이션
 
 업무 메모를 입력하면 AI가 자동으로 구조화하여 Notion 데이터베이스에 적재합니다.
 
