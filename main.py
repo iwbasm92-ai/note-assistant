@@ -1,6 +1,6 @@
 """
-AI Audit Note Assistant
-회계법인 감사팀을 위한 메모 자동화 데스크톱 애플리케이션
+AI Note Assistant
+메모 자동화 데스크톱 애플리케이션
 
 Features:
 - 텍스트 메모를 AI로 구조화된 JSON으로 변환
