@@ -1,2 +1,7 @@
 google-genai>=1.0.0
 requests>=2.31.0
+
+# 시스템 트레이 + 글로벌 핫키 (선택적, 없어도 앱 동작)
+pystray>=0.19.5
+pynput>=1.7.6
+Pillow>=10.0.0
