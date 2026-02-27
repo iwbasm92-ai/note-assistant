@@ -12,6 +12,9 @@ env/
 # Config (contains API keys)
 config.json
 
+# Local data
+history.json
+
 # IDE
 .idea/
 .vscode/
