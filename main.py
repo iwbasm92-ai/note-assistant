@@ -378,7 +378,7 @@ class NotionClient:
         )
 
         if response.status_code != 200:
-            return None
+            raise Exception(f"Notion 검색 오류: {response.status_code} - {response.text}")
 
         results = response.json().get("results", [])
         return results[0] if results else None
@@ -415,7 +415,7 @@ class NotionClient:
 
     def sync_task(self, task: dict) -> tuple[dict, str]:
         """태스크를 Notion에 동기화 (중복 감지 → 생성 또는 업데이트)"""
-        task_name = task.get("task_name", "Untitled")
+        task_name = task.get("task_name", "Untitled")[:100]
         client = task.get("client", "General")
 
         existing = self.query_existing_task(task_name, client)
