@@ -118,17 +118,21 @@ INSTRUCTIONS:
 3. Detect issues from negative keywords (지연, 미수령, 연락두절, 연락안됨, 오류, 문제, 이슈, 리스크, 우려)
 4. If issues detected, set Priority to "High"
 5. Extract company/client name if mentioned, otherwise use "General"
-6. Return ONLY a valid JSON array, no markdown code blocks
+6. Keep task_name consistent for the same logical task:
+   - Use the same canonical name for recurring work (e.g., always "삼성전자 재고실사" not "삼성전자 실사 작업")
+   - task_name should be a stable identifier: same task mentioned differently should produce the same task_name
+7. Return ONLY a valid JSON array, no markdown code blocks
 
 OUTPUT SCHEMA (return as JSON array):
 [
   {{
-    "task_name": "string (명사형 종결, 50자 이내)",
+    "task_name": "string (명사형 종결, 50자 이내, 동일 업무는 동일 이름 유지)",
     "client": "string (회사명 or 'General')",
     "due_date": "YYYY-MM-DD or null if not specified",
     "priority": "High|Medium|Low",
     "issue": "string describing blocker or null",
-    "original_text": "string (원본 메모 발췌)"
+    "original_text": "string (원본 메모 발췌)",
+    "memo_note": "string (추가 맥락이나 업데이트 사항) or null"
   }}
 ]
 
@@ -232,6 +236,79 @@ class NotionClient:
             "Content-Type": "application/json"
         }
     
+    def _build_content_blocks(self, task: dict, is_update: bool = False) -> list[dict]:
+        """태스크 정보를 Notion 콘텐츠 블록(페이지 본문)으로 변환"""
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+        blocks = []
+
+        if is_update:
+            blocks.append({"object": "block", "type": "divider", "divider": {}})
+            blocks.append({
+                "object": "block", "type": "heading_3",
+                "heading_3": {
+                    "rich_text": [{"type": "text", "text": {"content": f"📝 추가 메모 ({now_str})"}}]
+                }
+            })
+        else:
+            blocks.append({
+                "object": "block", "type": "heading_2",
+                "heading_2": {
+                    "rich_text": [{"type": "text", "text": {"content": "📋 태스크 상세"}}]
+                }
+            })
+            blocks.append({
+                "object": "block", "type": "paragraph",
+                "paragraph": {
+                    "rich_text": [{"type": "text", "text": {"content": f"생성일시: {now_str}"}, "annotations": {"color": "gray"}}]
+                }
+            })
+            blocks.append({"object": "block", "type": "divider", "divider": {}})
+
+        if task.get("priority") == "High":
+            blocks.append({
+                "object": "block", "type": "callout",
+                "callout": {
+                    "icon": {"type": "emoji", "emoji": "🚨"},
+                    "rich_text": [{"type": "text", "text": {"content": f"우선순위: {task['priority']}"}}]
+                }
+            })
+
+        if task.get("issue"):
+            blocks.append({
+                "object": "block", "type": "callout",
+                "callout": {
+                    "icon": {"type": "emoji", "emoji": "⚠️"},
+                    "rich_text": [{"type": "text", "text": {"content": f"이슈: {task['issue']}"}}]
+                }
+            })
+
+        if task.get("original_text"):
+            blocks.append({
+                "object": "block", "type": "heading_3",
+                "heading_3": {
+                    "rich_text": [{"type": "text", "text": {"content": "원본 메모"}}]
+                }
+            })
+            blocks.append({
+                "object": "block", "type": "quote",
+                "quote": {
+                    "rich_text": [{"type": "text", "text": {"content": task["original_text"][:2000]}}]
+                }
+            })
+
+        if task.get("memo_note"):
+            blocks.append({
+                "object": "block", "type": "paragraph",
+                "paragraph": {
+                    "rich_text": [
+                        {"type": "text", "text": {"content": "💬 "}, "annotations": {"bold": True}},
+                        {"type": "text", "text": {"content": task["memo_note"]}}
+                    ]
+                }
+            })
+
+        return blocks
+
     def _build_page_properties(self, task: dict) -> dict:
         """태스크 딕셔너리를 Notion 페이지 속성으로 변환"""
         properties = {
@@ -261,32 +338,107 @@ class NotionClient:
         
         return properties
     
-    def create_page(self, task: dict) -> dict:
-        """Notion 데이터베이스에 새 페이지 생성"""
+    def create_page(self, task: dict, children: list[dict] = None) -> dict:
+        """Notion 데이터베이스에 새 페이지 생성 (본문 블록 포함)"""
         payload = {
             "parent": {"database_id": self.database_id},
             "properties": self._build_page_properties(task)
         }
-        
+
+        if children:
+            payload["children"] = children
+
         response = requests.post(
             f"{self.BASE_URL}/pages",
             headers=self.headers,
             json=payload
         )
-        
+
         if response.status_code != 200:
             raise Exception(f"Notion API 오류: {response.status_code} - {response.text}")
-        
+
         return response.json()
     
-    def create_pages(self, tasks: list[dict]) -> list[dict]:
-        """여러 태스크를 Notion에 일괄 생성"""
+    def query_existing_task(self, task_name: str, client: str) -> dict | None:
+        """Task Name + Client 조합으로 기존 페이지 검색"""
+        payload = {
+            "filter": {
+                "and": [
+                    {"property": "Task Name", "title": {"equals": task_name}},
+                    {"property": "Client", "select": {"equals": client}}
+                ]
+            },
+            "page_size": 1
+        }
+
+        response = requests.post(
+            f"{self.BASE_URL}/databases/{self.database_id}/query",
+            headers=self.headers,
+            json=payload
+        )
+
+        if response.status_code != 200:
+            return None
+
+        results = response.json().get("results", [])
+        return results[0] if results else None
+
+    def update_page_properties(self, page_id: str, task: dict) -> dict:
+        """기존 페이지 속성 업데이트"""
+        payload = {"properties": self._build_page_properties(task)}
+
+        response = requests.patch(
+            f"{self.BASE_URL}/pages/{page_id}",
+            headers=self.headers,
+            json=payload
+        )
+
+        if response.status_code != 200:
+            raise Exception(f"Notion 페이지 업데이트 오류: {response.status_code} - {response.text}")
+
+        return response.json()
+
+    def append_page_content(self, page_id: str, blocks: list[dict]) -> dict:
+        """기존 페이지에 콘텐츠 블록 추가"""
+        payload = {"children": blocks}
+
+        response = requests.patch(
+            f"{self.BASE_URL}/blocks/{page_id}/children",
+            headers=self.headers,
+            json=payload
+        )
+
+        if response.status_code != 200:
+            raise Exception(f"Notion 블록 추가 오류: {response.status_code} - {response.text}")
+
+        return response.json()
+
+    def sync_task(self, task: dict) -> tuple[dict, str]:
+        """태스크를 Notion에 동기화 (중복 감지 → 생성 또는 업데이트)"""
+        task_name = task.get("task_name", "Untitled")
+        client = task.get("client", "General")
+
+        existing = self.query_existing_task(task_name, client)
+
+        if existing:
+            page_id = existing["id"]
+            self.update_page_properties(page_id, task)
+            blocks = self._build_content_blocks(task, is_update=True)
+            self.append_page_content(page_id, blocks)
+            return existing, "updated"
+        else:
+            blocks = self._build_content_blocks(task, is_update=False)
+            result = self.create_page(task, children=blocks)
+            return result, "created"
+
+    def sync_tasks(self, tasks: list[dict]) -> list[tuple[dict, str]]:
+        """여러 태스크를 일괄 동기화"""
         results = []
         for task in tasks:
-            result = self.create_page(task)
+            result = self.sync_task(task)
             results.append(result)
         return results
-    
+
     def test_connection(self) -> bool:
         """API 연결 및 데이터베이스 접근 테스트"""
         try:
@@ -556,34 +708,44 @@ class AuditNoteApp:
         thread.start()
     
     def _process_async(self, raw_text: str):
-        """백그라운드에서 AI 분석 및 Notion 전송"""
+        """백그라운드에서 AI 분석 및 Notion 동기화"""
         try:
             # 1. Gemini API 호출
             gemini = GeminiClient(self.config.get("gemini_api_key"))
             tasks = gemini.parse_memo(raw_text)
-            
+
             if not tasks:
                 self.root.after(0, lambda: self._on_error("AI가 태스크를 추출하지 못했습니다"))
                 return
-            
-            self.root.after(0, lambda: self._set_status(f"📤 Notion 전송 중... ({len(tasks)}개 태스크)"))
-            
-            # 2. Notion API 호출
+
+            self.root.after(0, lambda: self._set_status(f"📤 Notion 동기화 중... ({len(tasks)}개 태스크)"))
+
+            # 2. Notion 동기화 (중복 감지 포함)
             notion = NotionClient(
                 self.config.get("notion_token"),
                 self.config.get("notion_database_id")
             )
-            notion.create_pages(tasks)
-            
-            # 성공
-            self.root.after(0, lambda: self._on_success(len(tasks)))
-            
+            results = notion.sync_tasks(tasks)
+
+            # 3. 결과 집계
+            created = sum(1 for _, action in results if action == "created")
+            updated = sum(1 for _, action in results if action == "updated")
+
+            self.root.after(0, lambda: self._on_success(created, updated))
+
         except Exception as e:
             self.root.after(0, lambda: self._on_error(str(e)))
     
-    def _on_success(self, count: int):
-        """성공 처리"""
-        self._set_status(f"✅ 완료! {count}개 태스크가 Notion에 저장되었습니다")
+    def _on_success(self, created: int, updated: int):
+        """성공 처리 (생성/업데이트 구분 표시)"""
+        parts = []
+        if created > 0:
+            parts.append(f"생성 {created}개")
+        if updated > 0:
+            parts.append(f"업데이트 {updated}개")
+        summary = ", ".join(parts) if parts else "처리 완료"
+
+        self._set_status(f"✅ 완료! {summary}")
         self.text_input.config(state="normal")
         self.text_input.delete("1.0", END)
         self.submit_btn.config(state="normal")
