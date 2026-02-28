@@ -113,22 +113,40 @@ python main.py
 2. `/newbot` 명령으로 봇 생성
 3. 발급된 토큰을 `config.json`의 `telegram_bot_token`에 입력
 
-**사용자 제한 (선택):**
-- 본인 chat_id를 `telegram_allowed_users`에 추가하면 허가된 사용자만 사용 가능
-- chat_id 확인: 봇에 아무 메시지 전송 후 `https://api.telegram.org/bot<TOKEN>/getUpdates`에서 `chat.id` 확인
-- 비워두면 모든 사용자 허용
-
 ```bash
 python telegram_bot.py
 ```
+
+**API 키 설정 (두 가지 방법):**
+
+텔레그램 채팅에서 직접 설정할 수 있습니다:
+
+```
+# 방법 1: 대화형 위자드 — /setup 만 입력하면 단계별 안내
+/setup
+
+# 방법 2: 직접 입력
+/setup gemini <API 키>
+/setup notion <Integration Token>
+/setup database <Database ID>
+```
+
+또는 `config.json`을 직접 편집해도 됩니다.
+
+**사용자 제한 (선택):**
+- `config.json`의 `telegram_allowed_users`에 본인 chat_id를 추가하면 허가된 사용자만 사용 가능
+- chat_id 확인: 봇에 아무 메시지 전송 후 `https://api.telegram.org/bot<TOKEN>/getUpdates`에서 `chat.id` 확인
+- 비워두면 모든 사용자 허용
 
 **텔레그램 봇 명령어:**
 
 | 명령어 | 기능 |
 |--------|------|
 | `/start` | 봇 소개 및 사용법 |
+| `/setup` | API 키 설정 (위자드 또는 직접 입력) |
 | `/status` | Gemini/Notion 연결 상태 확인 |
 | `/help` | 상세 도움말 |
+| `/cancel` | 진행 중인 설정 취소 |
 | 텍스트 메시지 | 메모 입력 → AI 분석 → 미리보기 → 저장 |
 
 ---
@@ -233,6 +251,20 @@ Notion은 데이터베이스를 **Markdown & CSV** 형태로 내보내기를 지
 - CSV로 전체 속성을 테이블 형태로 추출 가능
 
 추출된 Markdown 파일은 Obsidian, Logseq 등의 로컬 지식 관리 도구에서 바로 활용할 수 있고, CSV는 스프레드시트나 데이터 분석 도구에서 활용 가능합니다.
+
+---
+
+## 보안
+
+이 도구는 **개인화된 1인용 도구**로 설계되었습니다. API 키 보호를 위한 보안 조치:
+
+- **config.json은 .gitignore에 포함** — API 키가 Git에 커밋되지 않음
+- **텔레그램 /setup 시 메시지 자동 삭제** — API 키가 포함된 메시지를 봇이 즉시 삭제. 삭제 실패 시 경고 메시지 표시
+- **에러 메시지 sanitization** — API 호출 실패 시 상세 에러(키, URL 등)는 서버 로그에만 기록. 텔레그램에는 일반 안내만 표시
+- **사용자 접근 제어** — `telegram_allowed_users`로 허가된 chat_id만 봇 사용 가능 (모든 핸들러에 적용)
+- **ConversationHandler 상태 격리** — 사용자별로 독립된 대화 상태. 다른 사용자의 설정/메모와 간섭 없음
+
+> `telegram_allowed_users`를 비워두면 봇 토큰을 아는 누구나 사용할 수 있습니다. 보안이 중요하면 반드시 본인 chat_id를 추가하세요.
 
 ---
 
