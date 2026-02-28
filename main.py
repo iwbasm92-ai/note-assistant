@@ -17,7 +17,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from tkinter import (
     Tk, Toplevel, Label, Entry, Button, Frame, Checkbutton, BooleanVar,
-    StringVar, Text, Scrollbar, Canvas, Listbox, messagebox,
+    StringVar, Text, Scrollbar, Canvas, Listbox, OptionMenu, messagebox,
     END, WORD, SINGLE, RIGHT, Y, BOTH, LEFT, X, TOP, BOTTOM
 )
 from tkinter.ttk import Style, Separator
@@ -134,10 +134,64 @@ OUTPUT SCHEMA (return as JSON array):
 ]
 
 IMPORTANT: Return ONLY the JSON array. Do not wrap in markdown code blocks."""
-    
+
+    CONTEXT_PROMPT_TEMPLATE = """You are a senior audit manager's assistant at an accounting firm.
+
+CONTEXT:
+- Current datetime: {current_datetime}
+- Today is {weekday_name} ({weekday_korean})
+- This week: {week_start} ~ {week_end}
+
+EXISTING TASKS IN DATABASE:
+{existing_tasks_list}
+
+INSTRUCTIONS:
+1. Parse the raw memo into structured task(s)
+2. Convert relative dates to absolute format (YYYY-MM-DD):
+   - "오늘" → {today}
+   - "내일" → {tomorrow}
+   - "모레" → {day_after_tomorrow}
+   - "이번 주" → this week ({week_start} ~ {week_end})
+   - "다음 주" → next week ({next_week_start} ~ {next_week_end})
+   - "다음 주 초" → {next_week_start}
+   - "다음 주 말" → {next_week_end}
+   - "월말" → {month_end}
+3. Detect issues from negative keywords (지연, 미수령, 연락두절, 연락안됨, 오류, 문제, 이슈, 리스크, 우려)
+4. If issues detected, set Priority to "High"
+5. Extract company/client name if mentioned, otherwise use "General"
+6. Follow-up detection:
+   - Compare the memo against EXISTING TASKS above
+   - If the memo is clearly a follow-up (same client AND same topic), set "related_to" to the EXACT task name from the list
+   - Only match when there is a clear contextual connection. If unsure, set null
+7. Generate 2-5 descriptive tags/keywords for categorization
+8. Write a brief context_note summarizing the key update in this memo entry
+9. Extract the user's own reasoning/judgment from the memo AS-IS:
+   - Look for expressions like "왜냐하면", "이유는", "판단 근거", "~해서", "~때문에", "~하려고"
+   - Preserve the user's original wording - do NOT fabricate or paraphrase
+   - If no explicit reasoning is present, set to null
+10. Return ONLY a valid JSON array, no markdown code blocks
+
+OUTPUT SCHEMA (return as JSON array):
+[
+  {{{{
+    "task_name": "string (명사형 종결, 50자 이내)",
+    "client": "string (회사명 or 'General')",
+    "due_date": "YYYY-MM-DD or null if not specified",
+    "priority": "High|Medium|Low",
+    "issue": "string describing blocker or null",
+    "original_text": "string (원본 메모 발췌)",
+    "tags": ["keyword1", "keyword2"],
+    "context_note": "string (이 메모의 핵심 업데이트 요약)",
+    "reasoning": "string (유저의 판단 근거 원문) or null",
+    "related_to": "exact existing task name or null"
+  }}}}
+]
+
+IMPORTANT: Return ONLY the JSON array. Do not wrap in markdown code blocks."""
+
     WEEKDAYS_KO = ["월요일", "화요일", "수요일", "목요일", "금요일", "토요일", "일요일"]
     WEEKDAYS_EN = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
-    
+
     def __init__(self, api_key: str):
         self.api_key = api_key
         self.client = genai.Client(
@@ -145,58 +199,63 @@ IMPORTANT: Return ONLY the JSON array. Do not wrap in markdown code blocks."""
             http_options={"timeout": 60_000}
         )
         self.model_name = "gemini-2.5-flash"
-    
-    def _build_system_prompt(self) -> str:
-        """현재 날짜/시간 정보를 포함한 시스템 프롬프트 생성"""
+
+    def _get_date_context(self) -> dict:
+        """현재 날짜/시간 컨텍스트 계산"""
         now = datetime.now()
         today = now.date()
-        
-        # 이번 주 시작(월요일)과 끝(일요일)
         week_start = today - timedelta(days=today.weekday())
         week_end = week_start + timedelta(days=6)
-        
-        # 다음 주
         next_week_start = week_end + timedelta(days=1)
         next_week_end = next_week_start + timedelta(days=6)
-        
-        # 월말
         if today.month == 12:
             month_end = today.replace(year=today.year + 1, month=1, day=1) - timedelta(days=1)
         else:
             month_end = today.replace(month=today.month + 1, day=1) - timedelta(days=1)
-        
-        return self.SYSTEM_PROMPT_TEMPLATE.format(
-            current_datetime=now.strftime("%Y-%m-%d %H:%M"),
-            weekday_name=self.WEEKDAYS_EN[today.weekday()],
-            weekday_korean=self.WEEKDAYS_KO[today.weekday()],
-            today=today.isoformat(),
-            tomorrow=(today + timedelta(days=1)).isoformat(),
-            day_after_tomorrow=(today + timedelta(days=2)).isoformat(),
-            week_start=week_start.isoformat(),
-            week_end=week_end.isoformat(),
-            next_week_start=next_week_start.isoformat(),
-            next_week_end=next_week_end.isoformat(),
-            month_end=month_end.isoformat()
-        )
-    
-    def parse_memo(self, raw_text: str) -> list[dict]:
-        """메모를 분석하여 구조화된 태스크 리스트 반환"""
-        system_prompt = self._build_system_prompt()
-        
-        response = self.client.models.generate_content(
-            model=self.model_name,
-            contents=f"{system_prompt}\n\nParse this memo:\n\n{raw_text}"
-        )
-        
-        result_text = response.text.strip()
-        
-        # 마크다운 코드 블록 제거
+        return {
+            "current_datetime": now.strftime("%Y-%m-%d %H:%M"),
+            "weekday_name": self.WEEKDAYS_EN[today.weekday()],
+            "weekday_korean": self.WEEKDAYS_KO[today.weekday()],
+            "today": today.isoformat(),
+            "tomorrow": (today + timedelta(days=1)).isoformat(),
+            "day_after_tomorrow": (today + timedelta(days=2)).isoformat(),
+            "week_start": week_start.isoformat(),
+            "week_end": week_end.isoformat(),
+            "next_week_start": next_week_start.isoformat(),
+            "next_week_end": next_week_end.isoformat(),
+            "month_end": month_end.isoformat(),
+        }
+
+    def _build_system_prompt(self) -> str:
+        """현재 날짜/시간 정보를 포함한 시스템 프롬프트 생성"""
+        return self.SYSTEM_PROMPT_TEMPLATE.format(**self._get_date_context())
+
+    @staticmethod
+    def _format_existing_tasks(existing_tasks: list[dict]) -> str:
+        """기존 태스크 목록을 프롬프트용 문자열로 변환"""
+        if not existing_tasks:
+            return "(No existing tasks found)"
+        lines = []
+        for t in existing_tasks:
+            line = f"- \"{t['task_name']}\" (Client: {t['client']}, Priority: {t['priority']})"
+            if t.get("due_date"):
+                line += f" Due: {t['due_date']}"
+            lines.append(line)
+        return "\n".join(lines)
+
+    def _build_context_prompt(self, existing_tasks: list[dict]) -> str:
+        """기존 태스크 컨텍스트를 포함한 시스템 프롬프트 생성"""
+        ctx = self._get_date_context()
+        ctx["existing_tasks_list"] = self._format_existing_tasks(existing_tasks)
+        return self.CONTEXT_PROMPT_TEMPLATE.format(**ctx)
+
+    def _parse_response(self, response_text: str) -> list[dict]:
+        """AI 응답 텍스트를 파싱하여 태스크 리스트 반환"""
+        result_text = response_text.strip()
         if result_text.startswith("```"):
             lines = result_text.split("\n")
-            # 첫 줄(```json)과 마지막 줄(```) 제거
             lines = [l for l in lines if not l.strip().startswith("```")]
             result_text = "\n".join(lines)
-        
         try:
             tasks = json.loads(result_text)
             if isinstance(tasks, dict):
@@ -204,7 +263,25 @@ IMPORTANT: Return ONLY the JSON array. Do not wrap in markdown code blocks."""
             return tasks
         except json.JSONDecodeError as e:
             raise ValueError(f"AI 응답 파싱 실패: {e}\n응답: {result_text[:200]}")
-    
+
+    def parse_memo(self, raw_text: str) -> list[dict]:
+        """메모를 분석하여 구조화된 태스크 리스트 반환"""
+        system_prompt = self._build_system_prompt()
+        response = self.client.models.generate_content(
+            model=self.model_name,
+            contents=f"{system_prompt}\n\nParse this memo:\n\n{raw_text}"
+        )
+        return self._parse_response(response.text)
+
+    def parse_memo_with_context(self, raw_text: str, existing_tasks: list[dict]) -> list[dict]:
+        """기존 태스크 맥락을 포함하여 메모 분석"""
+        system_prompt = self._build_context_prompt(existing_tasks)
+        response = self.client.models.generate_content(
+            model=self.model_name,
+            contents=f"{system_prompt}\n\nParse this memo:\n\n{raw_text}"
+        )
+        return self._parse_response(response.text)
+
     def test_connection(self) -> bool:
         """API 연결 테스트"""
         try:
@@ -223,10 +300,10 @@ IMPORTANT: Return ONLY the JSON array. Do not wrap in markdown code blocks."""
 
 class NotionClient:
     """Notion API 통신"""
-    
+
     API_VERSION = "2022-06-28"
     BASE_URL = "https://api.notion.com/v1"
-    
+
     def __init__(self, token: str, database_id: str):
         self.token = token
         self.database_id = database_id
@@ -235,9 +312,115 @@ class NotionClient:
             "Notion-Version": self.API_VERSION,
             "Content-Type": "application/json"
         }
-    
-    def _build_page_properties(self, task: dict) -> dict:
+
+    # ------------------------------------------------------------------
+    # 속성 추출 헬퍼
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _extract_title(prop: dict) -> str:
+        try:
+            return prop["title"][0]["plain_text"]
+        except (KeyError, IndexError, TypeError):
+            return ""
+
+    @staticmethod
+    def _extract_select(prop: dict) -> str:
+        try:
+            return prop["select"]["name"]
+        except (KeyError, TypeError):
+            return ""
+
+    @staticmethod
+    def _extract_date(prop: dict) -> str:
+        try:
+            return prop["date"]["start"]
+        except (KeyError, TypeError):
+            return ""
+
+    # ------------------------------------------------------------------
+    # 콘텐츠 블록 빌더
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _build_divider_block() -> dict:
+        return {"object": "block", "type": "divider", "divider": {}}
+
+    @staticmethod
+    def _build_heading3_block(text: str) -> dict:
+        return {
+            "object": "block", "type": "heading_3",
+            "heading_3": {"rich_text": [{"type": "text", "text": {"content": text}}]}
+        }
+
+    @staticmethod
+    def _build_paragraph_block(text: str) -> dict:
+        return {
+            "object": "block", "type": "paragraph",
+            "paragraph": {"rich_text": [{"type": "text", "text": {"content": text[:2000]}}]}
+        }
+
+    @staticmethod
+    def _build_callout_block(text: str, emoji: str = "📋") -> dict:
+        return {
+            "object": "block", "type": "callout",
+            "callout": {
+                "rich_text": [{"type": "text", "text": {"content": text[:2000]}}],
+                "icon": {"type": "emoji", "emoji": emoji}
+            }
+        }
+
+    # ------------------------------------------------------------------
+    # 페이지 본문 블록 조립
+    # ------------------------------------------------------------------
+
+    def build_new_page_body_blocks(self, task: dict) -> list[dict]:
+        """새 페이지의 본문 블록 생성 (메타데이터 포함)"""
+        now = datetime.now().strftime("%Y-%m-%d %H:%M")
+        tags_str = ", ".join(task.get("tags", [])) if task.get("tags") else "없음"
+        meta_text = (
+            f"생성일: {now}\n"
+            f"태그: {tags_str}\n"
+            f"고객사: {task.get('client', 'General')}"
+        )
+        blocks = [
+            self._build_callout_block(meta_text, "📋"),
+            self._build_divider_block(),
+            self._build_heading3_block(f"📝 {now}"),
+        ]
+        content = task.get("context_note") or task.get("original_text", "")
+        if content:
+            blocks.append(self._build_paragraph_block(content))
+        if task.get("reasoning"):
+            blocks.append(self._build_callout_block(task["reasoning"], "💭"))
+        if task.get("issue"):
+            blocks.append(self._build_callout_block(task["issue"], "🚨"))
+        return blocks
+
+    def build_append_blocks(self, task: dict) -> list[dict]:
+        """기존 페이지에 추가할 블록 생성"""
+        now = datetime.now().strftime("%Y-%m-%d %H:%M")
+        blocks = [
+            self._build_divider_block(),
+            self._build_heading3_block(f"📝 {now} (추가 메모)"),
+        ]
+        content = task.get("context_note") or task.get("original_text", "")
+        if content:
+            blocks.append(self._build_paragraph_block(content))
+        if task.get("reasoning"):
+            blocks.append(self._build_callout_block(task["reasoning"], "💭"))
+        if task.get("issue"):
+            blocks.append(self._build_callout_block(task["issue"], "🚨"))
+        return blocks
+
+    # ------------------------------------------------------------------
+    # 페이지 속성 빌더
+    # ------------------------------------------------------------------
+
+    def _build_page_properties(self, task: dict, available_props: dict = None) -> dict:
         """태스크 딕셔너리를 Notion 페이지 속성으로 변환"""
+        if available_props is None:
+            available_props = {}
         properties = {
             "Task Name": {
                 "title": [{"text": {"content": task.get("task_name", "Untitled")[:100]}}]
@@ -252,46 +435,165 @@ class NotionClient:
                 "rich_text": [{"text": {"content": task.get("original_text", "")[:2000]}}]
             }
         }
-        
-        # Due Date (선택적)
         if task.get("due_date"):
             properties["Due Date"] = {"date": {"start": task["due_date"]}}
-        
-        # Issue/Blocker (선택적)
         if task.get("issue"):
             properties["Issue/Blocker"] = {
                 "rich_text": [{"text": {"content": task["issue"][:2000]}}]
             }
-        
+        # 선택적 속성 (DB에 존재할 때만)
+        if available_props.get("tags") and task.get("tags"):
+            properties["Tags"] = {
+                "multi_select": [{"name": t} for t in task["tags"][:10]]
+            }
+        if available_props.get("related_tasks") and task.get("_related_page_id"):
+            properties["Related Tasks"] = {
+                "relation": [{"id": task["_related_page_id"]}]
+            }
         return properties
-    
+
+    def _build_update_properties(self, task: dict) -> dict:
+        """업데이트할 속성만 추출"""
+        props = {}
+        if task.get("priority"):
+            props["Priority"] = {"select": {"name": task["priority"]}}
+        if task.get("issue"):
+            props["Issue/Blocker"] = {
+                "rich_text": [{"text": {"content": task["issue"][:2000]}}]
+            }
+        if task.get("due_date"):
+            props["Due Date"] = {"date": {"start": task["due_date"]}}
+        return props
+
+    # ------------------------------------------------------------------
+    # API 호출
+    # ------------------------------------------------------------------
+
+    def query_database(self, limit: int = 50) -> list[dict]:
+        """최근 태스크 목록 조회"""
+        payload = {
+            "page_size": limit,
+            "sorts": [{"timestamp": "created_time", "direction": "descending"}]
+        }
+        response = requests.post(
+            f"{self.BASE_URL}/databases/{self.database_id}/query",
+            headers=self.headers,
+            json=payload,
+            timeout=30
+        )
+        if response.status_code != 200:
+            raise Exception(f"Notion 조회 오류: {response.status_code}")
+        results = response.json().get("results", [])
+        tasks = []
+        for page in results:
+            props = page.get("properties", {})
+            tasks.append({
+                "page_id": page["id"],
+                "task_name": self._extract_title(props.get("Task Name", {})),
+                "client": self._extract_select(props.get("Client", {})),
+                "priority": self._extract_select(props.get("Priority", {})),
+                "due_date": self._extract_date(props.get("Due Date", {})),
+                "created_time": page.get("created_time", ""),
+            })
+        return tasks
+
+    def detect_available_properties(self) -> dict:
+        """데이터베이스 스키마에서 선택적 속성 감지"""
+        response = requests.get(
+            f"{self.BASE_URL}/databases/{self.database_id}",
+            headers=self.headers,
+            timeout=15
+        )
+        if response.status_code != 200:
+            return {"tags": False, "related_tasks": False}
+        db_props = response.json().get("properties", {})
+        return {
+            "tags": "Tags" in db_props and db_props["Tags"].get("type") == "multi_select",
+            "related_tasks": "Related Tasks" in db_props and db_props["Related Tasks"].get("type") == "relation",
+        }
+
     def create_page(self, task: dict) -> dict:
         """Notion 데이터베이스에 새 페이지 생성"""
         payload = {
             "parent": {"database_id": self.database_id},
             "properties": self._build_page_properties(task)
         }
-        
         response = requests.post(
             f"{self.BASE_URL}/pages",
             headers=self.headers,
             json=payload,
             timeout=30
         )
-        
         if response.status_code != 200:
             raise Exception(f"Notion API 오류: {response.status_code} - {response.text}")
-        
         return response.json()
-    
+
+    def create_page_with_body(self, task: dict, available_props: dict = None) -> dict:
+        """본문 블록 포함하여 Notion 페이지 생성"""
+        payload = {
+            "parent": {"database_id": self.database_id},
+            "properties": self._build_page_properties(task, available_props),
+            "children": self.build_new_page_body_blocks(task)
+        }
+        response = requests.post(
+            f"{self.BASE_URL}/pages",
+            headers=self.headers,
+            json=payload,
+            timeout=30
+        )
+        if response.status_code != 200:
+            raise Exception(f"Notion API 오류: {response.status_code} - {response.text}")
+        return response.json()
+
+    def append_blocks(self, page_id: str, blocks: list[dict]) -> dict:
+        """기존 페이지에 콘텐츠 블록 추가"""
+        response = requests.patch(
+            f"{self.BASE_URL}/blocks/{page_id}/children",
+            headers=self.headers,
+            json={"children": blocks},
+            timeout=30
+        )
+        if response.status_code != 200:
+            raise Exception(f"Notion 블록 추가 오류: {response.status_code} - {response.text}")
+        return response.json()
+
+    def update_page_properties(self, page_id: str, properties: dict) -> dict:
+        """기존 페이지 속성 업데이트"""
+        response = requests.patch(
+            f"{self.BASE_URL}/pages/{page_id}",
+            headers=self.headers,
+            json={"properties": properties},
+            timeout=30
+        )
+        if response.status_code != 200:
+            raise Exception(f"Notion 업데이트 오류: {response.status_code} - {response.text}")
+        return response.json()
+
     def create_pages(self, tasks: list[dict]) -> list[dict]:
-        """여러 태스크를 Notion에 일괄 생성"""
+        """여러 태스크를 Notion에 일괄 생성 (하위 호환)"""
         results = []
         for task in tasks:
             result = self.create_page(task)
             results.append(result)
         return results
-    
+
+    def save_tasks(self, tasks: list[dict], available_props: dict = None) -> list[dict]:
+        """태스크 목록을 Notion에 저장 (신규 생성 또는 기존 페이지에 추가)"""
+        results = []
+        for task in tasks:
+            related_page_id = task.get("_related_page_id")
+            if related_page_id:
+                blocks = self.build_append_blocks(task)
+                self.append_blocks(related_page_id, blocks)
+                update_props = self._build_update_properties(task)
+                if update_props:
+                    self.update_page_properties(related_page_id, update_props)
+                results.append({"id": related_page_id, "action": "appended"})
+            else:
+                result = self.create_page_with_body(task, available_props)
+                results.append({"id": result["id"], "action": "created"})
+        return results
+
     def test_connection(self) -> bool:
         """API 연결 및 데이터베이스 접근 테스트"""
         try:
@@ -666,37 +968,80 @@ class NoteAssistantApp:
         thread.start()
     
     def _process_async(self, raw_text: str):
-        """백그라운드에서 AI 분석 후 미리보기 표시"""
+        """백그라운드에서 기존 태스크 조회 → AI 분석 → 미리보기"""
         try:
             gemini = GeminiClient(self.config.get("gemini_api_key"))
-            tasks = gemini.parse_memo(raw_text)
+            notion = NotionClient(
+                self.config.get("notion_token"),
+                self.config.get("notion_database_id")
+            )
+
+            # Phase 1: 기존 태스크 조회 + DB 스키마 감지
+            self.root.after(0, lambda: self._set_status("🔄 기존 태스크 조회 중..."))
+            try:
+                existing_tasks = notion.query_database(limit=50)
+            except Exception:
+                existing_tasks = []
+            try:
+                available_props = notion.detect_available_properties()
+            except Exception:
+                available_props = {"tags": False, "related_tasks": False}
+
+            # Phase 2: AI 분석 (기존 태스크 컨텍스트 포함)
+            self.root.after(0, lambda: self._set_status("🔄 AI 분석 중..."))
+            if existing_tasks:
+                tasks = gemini.parse_memo_with_context(raw_text, existing_tasks)
+            else:
+                tasks = gemini.parse_memo(raw_text)
 
             if not tasks:
                 self.root.after(0, lambda: self._on_error("AI가 태스크를 추출하지 못했습니다"))
                 return
 
-            self.root.after(0, lambda: self._show_preview(tasks, raw_text))
+            # related_to 이름 → page_id 매핑
+            name_to_page = {t["task_name"]: t["page_id"] for t in existing_tasks}
+            for task in tasks:
+                related_name = task.get("related_to")
+                if related_name and related_name in name_to_page:
+                    task["_related_page_id"] = name_to_page[related_name]
+                    task["_action"] = "append"
+                else:
+                    task["related_to"] = None
+                    task["_action"] = "create"
+
+            self.root.after(0, lambda: self._show_preview(
+                tasks, raw_text, available_props, existing_tasks
+            ))
 
         except Exception as e:
             self.root.after(0, lambda: self._on_error(str(e)))
 
-    def _show_preview(self, tasks: list[dict], raw_text: str):
-        """AI 분석 결과 미리보기 다이얼로그"""
+    def _show_preview(self, tasks: list[dict], raw_text: str,
+                      available_props: dict = None, existing_pages: list[dict] = None):
+        """AI 분석 결과 미리보기 다이얼로그 (맥락 연속 + 메타데이터)"""
         self.text_input.config(state="normal")
         self.submit_btn.config(state="normal")
         self._set_status(f"🔍 {len(tasks)}개 태스크 분석 완료 - 확인 후 저장하세요")
 
+        if existing_pages is None:
+            existing_pages = []
+        if available_props is None:
+            available_props = {}
+
+        # 드롭다운 옵션 빌드
+        page_lookup = {p["task_name"]: p["page_id"] for p in existing_pages if p["task_name"]}
+        dropdown_options = ["📄 새 페이지 생성"] + [f"📎 {name}" for name in page_lookup]
+
         dialog = Toplevel(self.root)
         dialog.title("🔍 AI 분석 결과 확인")
-        width, height = 600, 500
+        width, height = 650, 550
         dialog.geometry(f"{width}x{height}")
         dialog.resizable(True, True)
-        dialog.minsize(400, 300)
+        dialog.minsize(450, 350)
         dialog.attributes("-topmost", True)
         dialog.transient(self.root)
         dialog.grab_set()
 
-        # 중앙 정렬
         dialog.update_idletasks()
         x = self.root.winfo_x() + (self.root.winfo_width() - width) // 2
         y = self.root.winfo_y() + (self.root.winfo_height() - height) // 2
@@ -720,26 +1065,55 @@ class NoteAssistantApp:
         scrollbar.pack(side=RIGHT, fill=Y)
         canvas.pack(side=LEFT, fill=BOTH, expand=True)
 
-        # 마우스 휠 스크롤 지원
         def _on_mousewheel(event):
             canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
         canvas.bind_all("<MouseWheel>", _on_mousewheel)
 
-        # 태스크 카드 표시
+        # 태스크별 reasoning Entry 참조 저장
+        reasoning_entries = []
         priority_colors = {"High": "#e74c3c", "Medium": "#f39c12", "Low": "#27ae60"}
 
         for i, task in enumerate(tasks):
             card = Frame(scroll_frame, relief="groove", bd=1, padx=10, pady=8)
             card.pack(fill=X, pady=(0, 8), padx=5)
 
-            # 태스크 이름 (굵게)
+            # 액션 드롭다운 (혼합 매칭)
+            if dropdown_options:
+                if task.get("_action") == "append" and task.get("related_to"):
+                    default_opt = f"📎 {task['related_to']}"
+                    if default_opt not in dropdown_options:
+                        default_opt = "📄 새 페이지 생성"
+                else:
+                    default_opt = "📄 새 페이지 생성"
+
+                action_var = StringVar(value=default_opt)
+                task_ref = task  # 클로저 참조
+
+                def make_callback(t, var):
+                    def on_change(*_):
+                        sel = var.get()
+                        if sel == "📄 새 페이지 생성":
+                            t["_action"] = "create"
+                            t["_related_page_id"] = None
+                            t["related_to"] = None
+                        else:
+                            matched = sel.replace("📎 ", "")
+                            t["_action"] = "append"
+                            t["_related_page_id"] = page_lookup.get(matched)
+                            t["related_to"] = matched
+                    return on_change
+
+                action_var.trace_add("write", make_callback(task_ref, action_var))
+                OptionMenu(card, action_var, *dropdown_options).pack(fill=X, pady=(0, 4))
+
+            # 태스크 이름
             name = task.get("task_name", "Untitled")
-            name_label = Label(card, text=f"📌 {name}", font=(SYSTEM_FONT[0], SYSTEM_FONT[1], "bold"), anchor="w")
-            name_label.pack(fill=X)
+            Label(card, text=f"📌 {name}", font=(SYSTEM_FONT[0], SYSTEM_FONT[1], "bold"),
+                  anchor="w").pack(fill=X)
             if len(name) > 100:
                 Label(card, text="⚠️ (Notion 저장 시 100자로 잘림)", fg="orange", font=("", 8)).pack(anchor="w")
 
-            # 메타 정보 한 줄
+            # 메타 정보
             client = task.get("client", "General")
             due = task.get("due_date") or "미지정"
             priority = task.get("priority", "Medium")
@@ -750,25 +1124,65 @@ class NoteAssistantApp:
             Label(meta_frame, text=f"📅 {due}", fg="gray", font=("", 9)).pack(side=LEFT, padx=(0, 10))
             Label(meta_frame, text=f"⚡ {priority}", fg=p_color, font=("", 9, "bold")).pack(side=LEFT)
 
-            # 이슈 (있으면 강조)
+            # Tags
+            tags = task.get("tags", [])
+            if tags:
+                tags_text = " ".join(f"#{tag}" for tag in tags)
+                Label(card, text=f"🏷️ {tags_text}", fg="#8e44ad", font=("", 9),
+                      anchor="w").pack(fill=X, pady=(3, 0))
+
+            # 컨텍스트 요약
+            context = task.get("context_note")
+            if context:
+                Label(card, text=f"📝 {context}", fg="#2c3e50", font=("", 9),
+                      wraplength=550, anchor="w", justify=LEFT).pack(fill=X, pady=(3, 0))
+
+            # 판단 근거 (AI 추출)
+            reasoning = task.get("reasoning")
+            if reasoning:
+                Label(card, text=f"💭 {reasoning}", fg="#5d6d7e", font=("", 9),
+                      wraplength=550, anchor="w", justify=LEFT).pack(fill=X, pady=(3, 0))
+
+            # 이슈
             issue = task.get("issue")
             if issue:
-                Label(card, text=f"🚨 {issue}", fg="#e74c3c", font=("", 9), wraplength=500, anchor="w", justify=LEFT).pack(fill=X, pady=(3, 0))
+                Label(card, text=f"🚨 {issue}", fg="#e74c3c", font=("", 9),
+                      wraplength=550, anchor="w", justify=LEFT).pack(fill=X, pady=(3, 0))
 
             # 원본 텍스트 (축약)
             orig = task.get("original_text", "")
             if orig:
                 display_orig = orig[:120] + "..." if len(orig) > 120 else orig
-                Label(card, text=f"💬 {display_orig}", fg="gray", font=("", 8), wraplength=500, anchor="w", justify=LEFT).pack(fill=X, pady=(3, 0))
+                Label(card, text=f"💬 {display_orig}", fg="gray", font=("", 8),
+                      wraplength=550, anchor="w", justify=LEFT).pack(fill=X, pady=(3, 0))
+
+            # 편집 가능한 판단 근거 입력
+            reasoning_frame = Frame(card)
+            reasoning_frame.pack(fill=X, pady=(4, 0))
+            Label(reasoning_frame, text="💭", font=("", 9)).pack(side=LEFT)
+            reasoning_var = StringVar(value=reasoning or "")
+            reasoning_entry = Entry(reasoning_frame, textvariable=reasoning_var, font=("", 9))
+            reasoning_entry.pack(side=LEFT, fill=X, expand=True, padx=(4, 0))
+            if not reasoning:
+                reasoning_entry.insert(0, "")
+                reasoning_entry.config(fg="gray")
+                def on_focus_in(e, entry=reasoning_entry):
+                    entry.config(fg="black")
+                reasoning_entry.bind("<FocusIn>", on_focus_in)
+            reasoning_entries.append((task, reasoning_var))
 
         # 하단 버튼
         btn_frame = Frame(dialog, padx=15, pady=10)
         btn_frame.pack(fill=X, side=BOTTOM)
 
         def on_save():
+            # reasoning Entry 값을 태스크에 반영
+            for t, var in reasoning_entries:
+                val = var.get().strip()
+                t["reasoning"] = val if val else None
             canvas.unbind_all("<MouseWheel>")
             dialog.destroy()
-            self._confirm_and_save(tasks, raw_text)
+            self._confirm_and_save(tasks, raw_text, available_props)
 
         def on_cancel():
             canvas.unbind_all("<MouseWheel>")
@@ -778,9 +1192,16 @@ class NoteAssistantApp:
         Button(btn_frame, text="취소", command=on_cancel, width=10).pack(side=RIGHT, padx=(10, 0))
         Button(btn_frame, text="📤 Notion에 저장", command=on_save, width=18, font=("", 10)).pack(side=RIGHT)
 
-        Label(btn_frame, text=f"총 {len(tasks)}개 태스크", fg="gray").pack(side=LEFT)
+        new_count = sum(1 for t in tasks if t.get("_action") != "append")
+        append_count = sum(1 for t in tasks if t.get("_action") == "append")
+        parts = []
+        if new_count:
+            parts.append(f"신규 {new_count}개")
+        if append_count:
+            parts.append(f"추가 {append_count}개")
+        Label(btn_frame, text=f"총 {len(tasks)}개 태스크 ({', '.join(parts)})", fg="gray").pack(side=LEFT)
 
-    def _confirm_and_save(self, tasks: list[dict], raw_text: str):
+    def _confirm_and_save(self, tasks: list[dict], raw_text: str, available_props: dict = None):
         """미리보기 확인 후 Notion 저장 실행"""
         self.submit_btn.config(state="disabled")
         self.text_input.config(state="disabled")
@@ -792,8 +1213,10 @@ class NoteAssistantApp:
                     self.config.get("notion_token"),
                     self.config.get("notion_database_id")
                 )
-                notion.create_pages(tasks)
-                self.root.after(0, lambda: self._on_success(len(tasks), raw_text))
+                results = notion.save_tasks(tasks, available_props)
+                created = sum(1 for r in results if r["action"] == "created")
+                appended = sum(1 for r in results if r["action"] == "appended")
+                self.root.after(0, lambda: self._on_success(created, appended, raw_text))
             except Exception as e:
                 self.root.after(0, lambda: self._on_error(str(e)))
 
@@ -801,19 +1224,25 @@ class NoteAssistantApp:
         thread.daemon = True
         thread.start()
 
-    def _on_success(self, count: int, raw_text: str = ""):
+    def _on_success(self, created: int, appended: int, raw_text: str = ""):
         """성공 처리"""
-        # 기록 저장
+        total = created + appended
         if raw_text:
             self._memo_history.append({
                 "text": raw_text,
                 "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M"),
-                "task_count": count
+                "task_count": total
             })
             if len(self._memo_history) > self._history_max:
                 self._memo_history.pop(0)
 
-        self._set_status(f"✅ 완료! {count}개 태스크가 Notion에 저장되었습니다")
+        parts = []
+        if created:
+            parts.append(f"신규 {created}개")
+        if appended:
+            parts.append(f"추가 {appended}개")
+        msg = ", ".join(parts) if parts else f"{total}개"
+        self._set_status(f"✅ 완료! {msg} 태스크가 Notion에 저장되었습니다")
         self.text_input.config(state="normal")
         self.text_input.delete("1.0", END)
         self.submit_btn.config(state="normal")
