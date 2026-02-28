@@ -35,7 +35,9 @@ DEFAULT_CONFIG = {
     "gemini_api_key": "",
     "notion_token": "",
     "notion_database_id": "",
-    "always_on_top": True
+    "always_on_top": True,
+    "telegram_bot_token": "",
+    "telegram_allowed_users": []
 }
 
 # 플랫폼별 폰트 설정
