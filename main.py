@@ -17,7 +17,8 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from tkinter import (
     Tk, Toplevel, Label, Entry, Button, Frame, Checkbutton, BooleanVar,
-    StringVar, Text, Scrollbar, messagebox, END, WORD, RIGHT, Y, BOTH, LEFT, X, TOP, BOTTOM
+    StringVar, Text, Scrollbar, Canvas, Listbox, messagebox,
+    END, WORD, SINGLE, RIGHT, Y, BOTH, LEFT, X, TOP, BOTTOM
 )
 from tkinter.ttk import Style, Separator
 
@@ -139,7 +140,10 @@ IMPORTANT: Return ONLY the JSON array. Do not wrap in markdown code blocks."""
     
     def __init__(self, api_key: str):
         self.api_key = api_key
-        self.client = genai.Client(api_key=api_key)
+        self.client = genai.Client(
+            api_key=api_key,
+            http_options={"timeout": 60_000}
+        )
         self.model_name = "gemini-2.5-flash"
     
     def _build_system_prompt(self) -> str:
@@ -271,7 +275,8 @@ class NotionClient:
         response = requests.post(
             f"{self.BASE_URL}/pages",
             headers=self.headers,
-            json=payload
+            json=payload,
+            timeout=30
         )
         
         if response.status_code != 200:
@@ -292,7 +297,8 @@ class NotionClient:
         try:
             response = requests.get(
                 f"{self.BASE_URL}/databases/{self.database_id}",
-                headers=self.headers
+                headers=self.headers,
+                timeout=15
             )
             return response.status_code == 200
         except Exception:
@@ -313,21 +319,23 @@ class SettingsDialog:
         
         self.dialog = Toplevel(parent)
         self.dialog.title("⚙️ 설정")
-        self.dialog.geometry("450x350")
-        self.dialog.resizable(False, False)
-        
+        width, height = 550, 400
+        self.dialog.geometry(f"{width}x{height}")
+        self.dialog.resizable(True, True)
+        self.dialog.minsize(450, 350)
+
         # 설정창을 항상 최상위로 표시 (팝업처럼 동작)
         self.dialog.attributes("-topmost", True)
-        
+
         # 모달 다이얼로그 설정
         self.dialog.transient(parent)
         self.dialog.grab_set()
-        
+
         # 중앙 정렬
         self.dialog.update_idletasks()
-        x = parent.winfo_x() + (parent.winfo_width() - 450) // 2
-        y = parent.winfo_y() + (parent.winfo_height() - 350) // 2
-        self.dialog.geometry(f"+{x}+{y}")
+        x = parent.winfo_x() + (parent.winfo_width() - width) // 2
+        y = parent.winfo_y() + (parent.winfo_height() - height) // 2
+        self.dialog.geometry(f"{width}x{height}+{x}+{y}")
         
         # 창을 앞으로 가져오고 포커스 (지연 후 다시 호출로 확실히 포커스)
         self.dialog.lift()
@@ -336,39 +344,70 @@ class SettingsDialog:
         
         self._create_widgets()
     
+    @staticmethod
+    def _make_toggle_entry(parent, text_var, show_char="*"):
+        """비밀번호 표시/숨기기 토글이 있는 Entry 생성"""
+        frame = Frame(parent)
+        entry = Entry(frame, textvariable=text_var, show=show_char, width=50)
+        entry.pack(side=LEFT, fill=X, expand=True)
+        def toggle():
+            if entry.cget("show") == "*":
+                entry.config(show="")
+                btn.config(text="🙈")
+            else:
+                entry.config(show="*")
+                btn.config(text="👁️")
+        btn = Button(frame, text="👁️", command=toggle, width=3)
+        btn.pack(side=RIGHT, padx=(5, 0))
+        return frame
+
     def _create_widgets(self):
         main_frame = Frame(self.dialog, padx=20, pady=20)
         main_frame.pack(fill=BOTH, expand=True)
-        
+
         # Gemini API Key
         Label(main_frame, text="Gemini API Key:", anchor="w").pack(fill=X, pady=(0, 5))
         self.gemini_key_var = StringVar(value=self.config.get("gemini_api_key", ""))
-        Entry(main_frame, textvariable=self.gemini_key_var, show="*", width=50).pack(fill=X, pady=(0, 15))
-        
+        self._make_toggle_entry(main_frame, self.gemini_key_var).pack(fill=X, pady=(0, 15))
+
         # Notion Token
         Label(main_frame, text="Notion Integration Token:", anchor="w").pack(fill=X, pady=(0, 5))
         self.notion_token_var = StringVar(value=self.config.get("notion_token", ""))
-        Entry(main_frame, textvariable=self.notion_token_var, show="*", width=50).pack(fill=X, pady=(0, 15))
-        
+        self._make_toggle_entry(main_frame, self.notion_token_var).pack(fill=X, pady=(0, 15))
+
         # Notion Database ID
         Label(main_frame, text="Notion Database ID:", anchor="w").pack(fill=X, pady=(0, 5))
         self.notion_db_var = StringVar(value=self.config.get("notion_database_id", ""))
         Entry(main_frame, textvariable=self.notion_db_var, width=50).pack(fill=X, pady=(0, 20))
-        
+
         # 버튼 프레임
         btn_frame = Frame(main_frame)
         btn_frame.pack(fill=X)
-        
-        Button(btn_frame, text="🔗 연결 테스트", command=self._test_connections, width=15).pack(side=LEFT)
+
+        self._test_btn = Button(btn_frame, text="🔗 연결 테스트", command=self._test_connections, width=15)
+        self._test_btn.pack(side=LEFT)
         Button(btn_frame, text="취소", command=self.dialog.destroy, width=10).pack(side=RIGHT, padx=(10, 0))
         Button(btn_frame, text="💾 저장", command=self._save, width=10).pack(side=RIGHT)
     
     def _test_connections(self):
-        """API 연결 테스트"""
-        results = []
-        
-        # Gemini 테스트
+        """API 연결 테스트 (비동기)"""
+        self._test_btn.config(state="disabled", text="🔄 테스트 중...")
         gemini_key = self.gemini_key_var.get().strip()
+        notion_token = self.notion_token_var.get().strip()
+        notion_db = self.notion_db_var.get().strip()
+
+        thread = threading.Thread(
+            target=self._test_connections_async,
+            args=(gemini_key, notion_token, notion_db)
+        )
+        thread.daemon = True
+        thread.start()
+
+    def _test_connections_async(self, gemini_key, notion_token, notion_db):
+        """백그라운드에서 API 연결 테스트 실행"""
+        results = []
+
+        # Gemini 테스트
         if gemini_key:
             try:
                 client = GeminiClient(gemini_key)
@@ -377,13 +416,11 @@ class SettingsDialog:
                 else:
                     results.append("❌ Gemini API: 연결 실패")
             except Exception as e:
-                results.append(f"❌ Gemini API: {str(e)[:50]}")
+                results.append(f"❌ Gemini API: {str(e)[:80]}")
         else:
             results.append("⚠️ Gemini API Key가 입력되지 않았습니다")
-        
+
         # Notion 테스트
-        notion_token = self.notion_token_var.get().strip()
-        notion_db = self.notion_db_var.get().strip()
         if notion_token and notion_db:
             try:
                 client = NotionClient(notion_token, notion_db)
@@ -392,10 +429,21 @@ class SettingsDialog:
                 else:
                     results.append("❌ Notion API: 연결 실패 (토큰 또는 DB ID 확인)")
             except Exception as e:
-                results.append(f"❌ Notion API: {str(e)[:50]}")
+                results.append(f"❌ Notion API: {str(e)[:80]}")
         else:
             results.append("⚠️ Notion Token 또는 Database ID가 입력되지 않았습니다")
-        
+
+        try:
+            self.dialog.after(0, lambda: self._show_test_results(results))
+        except Exception:
+            pass  # 다이얼로그가 이미 닫힌 경우
+
+    def _show_test_results(self, results):
+        """연결 테스트 결과 표시"""
+        try:
+            self._test_btn.config(state="normal", text="🔗 연결 테스트")
+        except Exception:
+            pass
         messagebox.showinfo("연결 테스트 결과", "\n".join(results))
     
     def _save(self):
@@ -416,15 +464,17 @@ class SettingsDialog:
 # 메인 애플리케이션
 # ============================================================================
 
-class AuditNoteApp:
-    """AI Audit Note Assistant 메인 앱"""
+class NoteAssistantApp:
+    """AI Note Assistant 메인 앱"""
     
     def __init__(self):
         self.config = ConfigManager()
-        
+        self._memo_history: list[dict] = []
+        self._history_max = 20
+
         # 메인 윈도우 설정
         self.root = Tk()
-        self.root.title("📝 Audit Note Assistant")
+        self.root.title("📝 AI Note Assistant")
         self.root.geometry("400x500")
         self.root.minsize(350, 400)
         
@@ -446,7 +496,8 @@ class AuditNoteApp:
         toolbar.pack(fill=X)
         
         Button(toolbar, text="⚙️ 설정", command=self._show_settings).pack(side=LEFT)
-        
+        Button(toolbar, text="📋 기록", command=self._show_history).pack(side=LEFT, padx=(5, 0))
+
         Checkbutton(
             toolbar,
             text="📌 항상 위",
@@ -526,7 +577,66 @@ class AuditNoteApp:
     def _on_settings_saved(self):
         """설정 저장 후 콜백"""
         pass  # 필요시 클라이언트 재초기화
-    
+
+    def _show_history(self):
+        """메모 이전 기록 다이얼로그"""
+        if not self._memo_history:
+            messagebox.showinfo("기록 없음", "저장된 메모 기록이 없습니다.")
+            return
+
+        dialog = Toplevel(self.root)
+        dialog.title("📋 메모 기록")
+        width, height = 500, 400
+        dialog.geometry(f"{width}x{height}")
+        dialog.resizable(True, True)
+        dialog.minsize(350, 250)
+        dialog.attributes("-topmost", True)
+        dialog.transient(self.root)
+        dialog.grab_set()
+
+        dialog.update_idletasks()
+        x = self.root.winfo_x() + (self.root.winfo_width() - width) // 2
+        y = self.root.winfo_y() + (self.root.winfo_height() - height) // 2
+        dialog.geometry(f"{width}x{height}+{x}+{y}")
+
+        Label(dialog, text="저장된 메모를 선택하여 입력창에 불러올 수 있습니다.",
+              fg="gray", font=("", 9), padx=15, pady=5).pack(anchor="w")
+
+        # 리스트 영역
+        list_frame = Frame(dialog, padx=15, pady=5)
+        list_frame.pack(fill=BOTH, expand=True)
+
+        scrollbar = Scrollbar(list_frame)
+        scrollbar.pack(side=RIGHT, fill=Y)
+
+        listbox = Listbox(list_frame, font=SYSTEM_FONT, selectmode=SINGLE,
+                          yscrollcommand=scrollbar.set)
+        listbox.pack(fill=BOTH, expand=True)
+        scrollbar.config(command=listbox.yview)
+
+        # 최신순으로 표시
+        for entry in reversed(self._memo_history):
+            preview = entry["text"][:40].replace("\n", " ")
+            listbox.insert(END, f"[{entry['timestamp']}] {entry['task_count']}개 태스크 | {preview}...")
+
+        # 버튼
+        btn_frame = Frame(dialog, padx=15, pady=10)
+        btn_frame.pack(fill=X, side=BOTTOM)
+
+        def on_load():
+            sel = listbox.curselection()
+            if not sel:
+                messagebox.showwarning("선택 필요", "불러올 기록을 선택해주세요.")
+                return
+            idx = len(self._memo_history) - 1 - sel[0]  # 역순 인덱스
+            self.text_input.delete("1.0", END)
+            self.text_input.insert("1.0", self._memo_history[idx]["text"])
+            dialog.destroy()
+            self._set_status("📋 이전 메모를 불러왔습니다")
+
+        Button(btn_frame, text="닫기", command=dialog.destroy, width=10).pack(side=RIGHT, padx=(10, 0))
+        Button(btn_frame, text="📥 입력창에 불러오기", command=on_load, width=18).pack(side=RIGHT)
+
     def _set_status(self, message: str):
         """상태바 메시지 업데이트"""
         self.status_var.set(message)
@@ -556,33 +666,153 @@ class AuditNoteApp:
         thread.start()
     
     def _process_async(self, raw_text: str):
-        """백그라운드에서 AI 분석 및 Notion 전송"""
+        """백그라운드에서 AI 분석 후 미리보기 표시"""
         try:
-            # 1. Gemini API 호출
             gemini = GeminiClient(self.config.get("gemini_api_key"))
             tasks = gemini.parse_memo(raw_text)
-            
+
             if not tasks:
                 self.root.after(0, lambda: self._on_error("AI가 태스크를 추출하지 못했습니다"))
                 return
-            
-            self.root.after(0, lambda: self._set_status(f"📤 Notion 전송 중... ({len(tasks)}개 태스크)"))
-            
-            # 2. Notion API 호출
-            notion = NotionClient(
-                self.config.get("notion_token"),
-                self.config.get("notion_database_id")
-            )
-            notion.create_pages(tasks)
-            
-            # 성공
-            self.root.after(0, lambda: self._on_success(len(tasks)))
-            
+
+            self.root.after(0, lambda: self._show_preview(tasks, raw_text))
+
         except Exception as e:
             self.root.after(0, lambda: self._on_error(str(e)))
-    
-    def _on_success(self, count: int):
+
+    def _show_preview(self, tasks: list[dict], raw_text: str):
+        """AI 분석 결과 미리보기 다이얼로그"""
+        self.text_input.config(state="normal")
+        self.submit_btn.config(state="normal")
+        self._set_status(f"🔍 {len(tasks)}개 태스크 분석 완료 - 확인 후 저장하세요")
+
+        dialog = Toplevel(self.root)
+        dialog.title("🔍 AI 분석 결과 확인")
+        width, height = 600, 500
+        dialog.geometry(f"{width}x{height}")
+        dialog.resizable(True, True)
+        dialog.minsize(400, 300)
+        dialog.attributes("-topmost", True)
+        dialog.transient(self.root)
+        dialog.grab_set()
+
+        # 중앙 정렬
+        dialog.update_idletasks()
+        x = self.root.winfo_x() + (self.root.winfo_width() - width) // 2
+        y = self.root.winfo_y() + (self.root.winfo_height() - height) // 2
+        dialog.geometry(f"{width}x{height}+{x}+{y}")
+
+        # 스크롤 가능한 컨텐츠 영역
+        container = Frame(dialog)
+        container.pack(fill=BOTH, expand=True, padx=15, pady=(15, 5))
+
+        canvas = Canvas(container)
+        scrollbar = Scrollbar(container, command=canvas.yview)
+        scroll_frame = Frame(canvas)
+
+        scroll_frame.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
+        canvas.create_window((0, 0), window=scroll_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+
+        scrollbar.pack(side=RIGHT, fill=Y)
+        canvas.pack(side=LEFT, fill=BOTH, expand=True)
+
+        # 마우스 휠 스크롤 지원
+        def _on_mousewheel(event):
+            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        canvas.bind_all("<MouseWheel>", _on_mousewheel)
+
+        # 태스크 카드 표시
+        priority_colors = {"High": "#e74c3c", "Medium": "#f39c12", "Low": "#27ae60"}
+
+        for i, task in enumerate(tasks):
+            card = Frame(scroll_frame, relief="groove", bd=1, padx=10, pady=8)
+            card.pack(fill=X, pady=(0, 8), padx=5)
+
+            # 태스크 이름 (굵게)
+            name = task.get("task_name", "Untitled")
+            name_label = Label(card, text=f"📌 {name}", font=(SYSTEM_FONT[0], SYSTEM_FONT[1], "bold"), anchor="w")
+            name_label.pack(fill=X)
+            if len(name) > 100:
+                Label(card, text="⚠️ (Notion 저장 시 100자로 잘림)", fg="orange", font=("", 8)).pack(anchor="w")
+
+            # 메타 정보 한 줄
+            client = task.get("client", "General")
+            due = task.get("due_date") or "미지정"
+            priority = task.get("priority", "Medium")
+            p_color = priority_colors.get(priority, "gray")
+            meta_frame = Frame(card)
+            meta_frame.pack(fill=X, pady=(3, 0))
+            Label(meta_frame, text=f"🏢 {client}", fg="gray", font=("", 9)).pack(side=LEFT, padx=(0, 10))
+            Label(meta_frame, text=f"📅 {due}", fg="gray", font=("", 9)).pack(side=LEFT, padx=(0, 10))
+            Label(meta_frame, text=f"⚡ {priority}", fg=p_color, font=("", 9, "bold")).pack(side=LEFT)
+
+            # 이슈 (있으면 강조)
+            issue = task.get("issue")
+            if issue:
+                Label(card, text=f"🚨 {issue}", fg="#e74c3c", font=("", 9), wraplength=500, anchor="w", justify=LEFT).pack(fill=X, pady=(3, 0))
+
+            # 원본 텍스트 (축약)
+            orig = task.get("original_text", "")
+            if orig:
+                display_orig = orig[:120] + "..." if len(orig) > 120 else orig
+                Label(card, text=f"💬 {display_orig}", fg="gray", font=("", 8), wraplength=500, anchor="w", justify=LEFT).pack(fill=X, pady=(3, 0))
+
+        # 하단 버튼
+        btn_frame = Frame(dialog, padx=15, pady=10)
+        btn_frame.pack(fill=X, side=BOTTOM)
+
+        def on_save():
+            canvas.unbind_all("<MouseWheel>")
+            dialog.destroy()
+            self._confirm_and_save(tasks, raw_text)
+
+        def on_cancel():
+            canvas.unbind_all("<MouseWheel>")
+            dialog.destroy()
+            self._set_status("대기 중")
+
+        Button(btn_frame, text="취소", command=on_cancel, width=10).pack(side=RIGHT, padx=(10, 0))
+        Button(btn_frame, text="📤 Notion에 저장", command=on_save, width=18, font=("", 10)).pack(side=RIGHT)
+
+        Label(btn_frame, text=f"총 {len(tasks)}개 태스크", fg="gray").pack(side=LEFT)
+
+    def _confirm_and_save(self, tasks: list[dict], raw_text: str):
+        """미리보기 확인 후 Notion 저장 실행"""
+        self.submit_btn.config(state="disabled")
+        self.text_input.config(state="disabled")
+        self._set_status(f"📤 Notion 전송 중... ({len(tasks)}개 태스크)")
+
+        def save_async():
+            try:
+                notion = NotionClient(
+                    self.config.get("notion_token"),
+                    self.config.get("notion_database_id")
+                )
+                notion.create_pages(tasks)
+                self.root.after(0, lambda: self._on_success(len(tasks), raw_text))
+            except Exception as e:
+                self.root.after(0, lambda: self._on_error(str(e)))
+
+        thread = threading.Thread(target=save_async)
+        thread.daemon = True
+        thread.start()
+
+    def _on_success(self, count: int, raw_text: str = ""):
         """성공 처리"""
+        # 기록 저장
+        if raw_text:
+            self._memo_history.append({
+                "text": raw_text,
+                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                "task_count": count
+            })
+            if len(self._memo_history) > self._history_max:
+                self._memo_history.pop(0)
+
         self._set_status(f"✅ 완료! {count}개 태스크가 Notion에 저장되었습니다")
         self.text_input.config(state="normal")
         self.text_input.delete("1.0", END)
@@ -590,7 +820,8 @@ class AuditNoteApp:
     
     def _on_error(self, message: str):
         """에러 처리"""
-        self._set_status(f"❌ 오류: {message[:50]}...")
+        display_msg = message if len(message) < 80 else "상세 내용은 팝업 참조"
+        self._set_status(f"❌ 오류: {display_msg}")
         self.text_input.config(state="normal")
         self.submit_btn.config(state="normal")
         messagebox.showerror("오류 발생", message)
@@ -605,5 +836,5 @@ class AuditNoteApp:
 # ============================================================================
 
 if __name__ == "__main__":
-    app = AuditNoteApp()
+    app = NoteAssistantApp()
     app.run()
